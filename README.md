@@ -67,6 +67,12 @@ go build -o pomodoro-timer
 ./pomodoro-timer
 ```
 
+Можно добавить в консольные команды:
+
+```bash
+sudo ln -s /Users/user/path/to/project/pomodoro-timer /usr/local/bin/pomodoro
+```
+
 ## Использование
 
 1. Введите текст задачи в поле `New task` и нажмите `Добавить` или Enter.
