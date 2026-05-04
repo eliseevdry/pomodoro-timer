@@ -3,35 +3,36 @@ package main
 import (
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
 type pomodoroUI struct {
-	app    fyne.App
-	window fyne.Window
+	app fyne.App
 
 	content fyne.CanvasObject
 
 	store *taskStore
-	timer *pomodoroTimer
 
-	taskEntry       *widget.Entry
-	taskList        *widget.List
-	currentTaskText *widget.Label
-	timerText       *widget.Label
-	statusText      *widget.Label
-	progress        *widget.ProgressBar
-	startButton     *widget.Button
-	pauseButton     *widget.Button
-	resetButton     *widget.Button
-	deleteButton    *widget.Button
+	taskEntry *widget.Entry
+	taskList  *widget.List
+	addButton *widget.Button
+}
+
+type taskRowParts struct {
+	check  *widget.Check
+	title  *widget.Label
+	timer  *widget.Label
+	start  *widget.Button
+	pause  *widget.Button
+	reset  *widget.Button
+	delete *widget.Button
 }
 
 func main() {
@@ -39,7 +40,7 @@ func main() {
 	w := a.NewWindow("Pomodoro Timer")
 	w.Resize(fyne.NewSize(900, 560))
 
-	ui := newPomodoroUI(a, w)
+	ui := newPomodoroUI(a)
 	w.SetContent(ui.content)
 
 	ticker := time.NewTicker(time.Second)
@@ -49,27 +50,14 @@ func main() {
 	w.ShowAndRun()
 }
 
-func newPomodoroUI(a fyne.App, w fyne.Window) *pomodoroUI {
+func newPomodoroUI(a fyne.App) *pomodoroUI {
 	ui := &pomodoroUI{
-		app:    a,
-		window: w,
-		store:  newTaskStore(),
-		timer:  newPomodoroTimer(),
+		app:   a,
+		store: newTaskStore(),
 	}
 
 	ui.taskEntry = widget.NewEntry()
-	ui.taskEntry.SetPlaceHolder("Новая задача")
-
-	ui.currentTaskText = widget.NewLabel("Текущая задача: не выбрана")
-	ui.currentTaskText.Wrapping = fyne.TextWrapWord
-
-	ui.timerText = widget.NewLabelWithStyle(formatDuration(workDuration), fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-	ui.statusText = widget.NewLabel("Добавьте задачу и нажмите Старт.")
-	ui.statusText.Wrapping = fyne.TextWrapWord
-
-	ui.progress = widget.NewProgressBar()
-	ui.progress.Min = 0
-	ui.progress.Max = 1
+	ui.taskEntry.SetPlaceHolder("New task")
 
 	ui.taskList = ui.newTaskList()
 	ui.taskList.OnSelected = ui.selectTask
@@ -78,37 +66,17 @@ func newPomodoroUI(a fyne.App, w fyne.Window) *pomodoroUI {
 		ui.addTask()
 	}
 
-	addButton := widget.NewButtonWithIcon("Добавить", theme.ContentAddIcon(), ui.addTask)
-	ui.deleteButton = widget.NewButtonWithIcon("Удалить", theme.DeleteIcon(), ui.deleteSelectedTask)
-	ui.startButton = widget.NewButtonWithIcon("Старт", theme.MediaPlayIcon(), ui.startTimer)
-	ui.pauseButton = widget.NewButtonWithIcon("Пауза", theme.MediaPauseIcon(), ui.pauseTimer)
-	ui.resetButton = widget.NewButtonWithIcon("Сброс", theme.ViewRefreshIcon(), ui.resetTimer)
+	ui.addButton = widget.NewButtonWithIcon("", theme.ContentAddIcon(), ui.addTask)
 
-	taskControls := container.NewBorder(nil, nil, nil, addButton, ui.taskEntry)
-	leftPanel := container.NewBorder(
-		widget.NewLabelWithStyle("Задачи", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewVBox(taskControls, ui.deleteButton),
+	taskControls := container.NewBorder(nil, nil, nil, ui.addButton, ui.taskEntry)
+	content := container.NewBorder(
+		nil,
+		taskControls,
 		nil,
 		nil,
 		ui.taskList,
 	)
-
-	timerControls := container.NewGridWithColumns(3, ui.startButton, ui.pauseButton, ui.resetButton)
-	rightPanel := container.NewVBox(
-		widget.NewLabelWithStyle("Таймер", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		ui.currentTaskText,
-		ui.timerText,
-		ui.progress,
-		timerControls,
-		ui.statusText,
-	)
-
-	content := container.NewHSplit(leftPanel, container.NewPadded(rightPanel))
-	content.SetOffset(0.55)
 	ui.content = content
-
-	ui.deleteButton.Disable()
-	ui.refreshTimer()
 
 	return ui
 }
@@ -122,10 +90,20 @@ func (ui *pomodoroUI) newTaskList() *widget.List {
 			check := widget.NewCheck("", nil)
 			title := widget.NewLabel("")
 			title.Truncation = fyne.TextTruncateEllipsis
-			return container.NewBorder(nil, nil, check, nil, title)
+
+			timer := widget.NewLabelWithStyle(formatDuration(workDuration), fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+
+			startButton := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), nil)
+			pauseButton := widget.NewButtonWithIcon("", theme.MediaPauseIcon(), nil)
+			resetButton := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), nil)
+			deleteButton := widget.NewButtonWithIcon("", theme.DeleteIcon(), nil)
+
+			taskText := container.NewBorder(nil, nil, nil, timer, title)
+			controls := container.NewHBox(startButton, pauseButton, resetButton, deleteButton)
+			return container.NewBorder(nil, nil, check, controls, taskText)
 		},
 		func(id widget.ListItemID, item fyne.CanvasObject) {
-			check, title, ok := taskRowParts(item)
+			row, ok := findTaskRowParts(item)
 			if !ok {
 				return
 			}
@@ -136,46 +114,126 @@ func (ui *pomodoroUI) newTaskList() *widget.List {
 				return
 			}
 
-			check.OnChanged = nil
-			check.SetChecked(task.done)
-			check.OnChanged = func(done bool) {
+			row.check.OnChanged = nil
+			row.check.SetChecked(task.done)
+			row.check.OnChanged = func(done bool) {
 				ui.store.SetDone(index, done)
-				ui.taskList.Refresh()
+				ui.refreshTasks()
 			}
 
-			text := task.title
-			if index == ui.store.Selected() {
-				text = "-> " + text
-			}
-			if task.done {
-				text += " (выполнена)"
+			title := task.title
+			if !task.done && index == ui.store.Selected() {
+				title = "" + title
 			}
 
-			title.SetText(text)
-			title.TextStyle = fyne.TextStyle{Italic: task.done}
-			title.Refresh()
+			row.title.SetText(title)
+			row.title.TextStyle = fyne.TextStyle{Italic: task.done}
+			row.title.Refresh()
+			row.timer.SetText(formatDuration(task.remaining))
+
+			row.start.OnTapped = func() {
+				ui.startTask(index)
+			}
+			row.pause.OnTapped = func() {
+				ui.pauseTask(index)
+			}
+			row.reset.OnTapped = func() {
+				ui.resetTask(index)
+			}
+			row.delete.OnTapped = func() {
+				ui.deleteTask(index)
+			}
+
+			updateTaskRowVisibility(row, task, index == ui.store.Active())
 		},
 	)
 }
 
-func taskRowParts(item fyne.CanvasObject) (*widget.Check, *widget.Label, bool) {
-	row, ok := item.(*fyne.Container)
-	if !ok {
-		return nil, nil, false
+func updateTaskRowVisibility(row taskRowParts, task task, active bool) {
+	switch {
+	case task.done:
+		row.timer.Hide()
+		row.start.Hide()
+		row.pause.Hide()
+		row.reset.Hide()
+		row.delete.Show()
+	case task.running:
+		row.timer.Show()
+		row.start.Hide()
+		row.pause.Show()
+		row.reset.Show()
+		row.delete.Show()
+		row.pause.Enable()
+		row.reset.Enable()
+	case active:
+		row.timer.Show()
+		row.start.Show()
+		row.pause.Hide()
+		row.reset.Show()
+		row.delete.Show()
+		row.start.Enable()
+		row.reset.Enable()
+	default:
+		row.timer.Hide()
+		row.start.Show()
+		row.pause.Hide()
+		row.reset.Hide()
+		row.delete.Show()
+		row.start.Enable()
 	}
+}
 
-	var check *widget.Check
-	var title *widget.Label
-	for _, object := range row.Objects {
-		switch typed := object.(type) {
-		case *widget.Check:
-			check = typed
-		case *widget.Label:
-			title = typed
+func findTaskRowParts(item fyne.CanvasObject) (taskRowParts, bool) {
+	var parts taskRowParts
+	collectTaskRowParts(item, &parts)
+
+	ok := parts.check != nil &&
+		parts.title != nil &&
+		parts.timer != nil &&
+		parts.start != nil &&
+		parts.pause != nil &&
+		parts.reset != nil &&
+		parts.delete != nil
+
+	return parts, ok
+}
+
+func collectTaskRowParts(item fyne.CanvasObject, parts *taskRowParts) {
+	switch object := item.(type) {
+	case *widget.Check:
+		parts.check = object
+	case *widget.Label:
+		if object.TextStyle.Bold {
+			parts.timer = object
+		} else if parts.title == nil {
+			parts.title = object
+		}
+	case *widget.Button:
+		switch iconName(object.Icon) {
+		case "media-play":
+			parts.start = object
+		case "media-pause":
+			parts.pause = object
+		case "view-refresh":
+			parts.reset = object
+		case "delete":
+			parts.delete = object
+		}
+	case *fyne.Container:
+		for _, child := range object.Objects {
+			collectTaskRowParts(child, parts)
 		}
 	}
+}
 
-	return check, title, check != nil && title != nil
+func iconName(resource fyne.Resource) string {
+	if resource == nil {
+		return ""
+	}
+
+	name := strings.TrimPrefix(resource.Name(), "foreground_")
+	name = strings.TrimSuffix(name, ".svg")
+	return name
 }
 
 func (ui *pomodoroUI) addTask() {
@@ -186,31 +244,12 @@ func (ui *pomodoroUI) addTask() {
 	}
 
 	ui.taskEntry.SetText("")
-	ui.taskList.Refresh()
+	ui.refreshTasks()
 
 	if !hadSelection {
 		ui.taskList.Select(widget.ListItemID(index))
 		return
 	}
-
-	ui.refreshCurrentTask()
-}
-
-func (ui *pomodoroUI) deleteSelectedTask() {
-	if !ui.store.DeleteSelected() {
-		return
-	}
-
-	ui.timer.reset()
-	ui.statusText.SetText("Выберите задачу для нового таймера.")
-	ui.taskList.Refresh()
-
-	if selected := ui.store.Selected(); selected >= 0 {
-		ui.taskList.Select(widget.ListItemID(selected))
-		return
-	}
-
-	ui.refreshCurrentTask()
 }
 
 func (ui *pomodoroUI) selectTask(id widget.ListItemID) {
@@ -218,81 +257,44 @@ func (ui *pomodoroUI) selectTask(id widget.ListItemID) {
 		return
 	}
 
-	_, running := ui.timer.snapshot()
-	if !running {
-		ui.timer.reset()
-		ui.statusText.SetText("Готово к запуску 25-минутного таймера.")
+	ui.refreshTasks()
+}
+
+func (ui *pomodoroUI) startTask(index int) {
+	ui.store.Start(index)
+	ui.refreshTasks()
+}
+
+func (ui *pomodoroUI) pauseTask(index int) {
+	ui.store.Pause(index)
+	ui.refreshTasks()
+}
+
+func (ui *pomodoroUI) resetTask(index int) {
+	ui.store.Reset(index)
+	ui.refreshTasks()
+}
+
+func (ui *pomodoroUI) deleteTask(index int) {
+	if !ui.store.Delete(index) {
+		return
 	}
 
+	ui.refreshTasks()
+	if selected := ui.store.Selected(); selected >= 0 {
+		ui.taskList.Select(widget.ListItemID(selected))
+	}
+}
+
+func (ui *pomodoroUI) refreshTasks() {
 	ui.taskList.Refresh()
-	ui.refreshCurrentTask()
-}
-
-func (ui *pomodoroUI) startTimer() {
-	if ui.store.Selected() == -1 {
-		dialog.ShowInformation("Нет выбранной задачи", "Сначала добавьте и выберите задачу.", ui.window)
-		return
-	}
-
-	ui.timer.start()
-	ui.statusText.SetText("Таймер запущен.")
-	ui.refreshTimer()
-}
-
-func (ui *pomodoroUI) pauseTimer() {
-	ui.timer.pause()
-	ui.statusText.SetText("Таймер на паузе.")
-	ui.refreshTimer()
-}
-
-func (ui *pomodoroUI) resetTimer() {
-	ui.timer.reset()
-	ui.statusText.SetText("Таймер сброшен на 25:00.")
-	ui.refreshTimer()
-}
-
-func (ui *pomodoroUI) refreshCurrentTask() {
-	current, ok := ui.store.Current()
-	if !ok {
-		ui.currentTaskText.SetText("Текущая задача: не выбрана")
-		ui.deleteButton.Disable()
-		ui.refreshTimer()
-		return
-	}
-
-	ui.currentTaskText.SetText("Текущая задача: " + current.title)
-	ui.deleteButton.Enable()
-	ui.refreshTimer()
-}
-
-func (ui *pomodoroUI) refreshTimer() {
-	remaining, running := ui.timer.snapshot()
-	ui.timerText.SetText(formatDuration(remaining))
-	ui.progress.SetValue(progressForRemaining(remaining))
-
-	if ui.store.Selected() == -1 || running {
-		ui.startButton.Disable()
-	} else {
-		ui.startButton.Enable()
-	}
-
-	if running {
-		ui.pauseButton.Enable()
-	} else {
-		ui.pauseButton.Disable()
-	}
-
-	if remaining == workDuration && !running {
-		ui.resetButton.Disable()
-	} else {
-		ui.resetButton.Enable()
-	}
 }
 
 func (ui *pomodoroUI) runTimer(ticker *time.Ticker) {
 	for range ticker.C {
-		if !ui.timer.tick() {
-			fyne.Do(ui.refreshTimer)
+		title, finished := ui.store.AdvanceActive(time.Second)
+		fyne.Do(ui.refreshTasks)
+		if !finished {
 			continue
 		}
 
@@ -300,10 +302,8 @@ func (ui *pomodoroUI) runTimer(ticker *time.Ticker) {
 		fyne.Do(func() {
 			ui.app.SendNotification(fyne.NewNotification(
 				"Pomodoro завершен",
-				"25 минут истекли. Задача не отмечена выполненной автоматически.",
+				"25 минут истекли: "+title,
 			))
-			ui.statusText.SetText("Время вышло. Отметьте задачу выполненной вручную, если она завершена.")
-			ui.refreshTimer()
 		})
 	}
 }
