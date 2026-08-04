@@ -30,6 +30,38 @@ func newTaskStore() *taskStore {
 	}
 }
 
+func (s *taskStore) Snapshot() persistedTasks {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tasks := make([]task, len(s.tasks))
+	copy(tasks, s.tasks)
+	return persistedTasks{
+		tasks: tasks,
+	}
+}
+
+func (s *taskStore) Restore(snapshot persistedTasks) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.tasks = make([]task, len(snapshot.tasks))
+	for index, restoredTask := range snapshot.tasks {
+		s.tasks[index] = task{
+			title:     restoredTask.title,
+			done:      restoredTask.done,
+			remaining: workDuration,
+		}
+	}
+
+	s.selected = -1
+	if len(s.tasks) > 0 {
+		s.selected = 0
+	}
+
+	s.active = -1
+}
+
 func (s *taskStore) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -147,6 +179,23 @@ func (s *taskStore) Current() (task, bool) {
 	defer s.mu.Unlock()
 
 	return s.task(s.selected)
+}
+
+func (s *taskStore) Rename(index int, title string) bool {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if index < 0 || index >= len(s.tasks) {
+		return false
+	}
+
+	s.tasks[index].title = title
+	return true
 }
 
 func (s *taskStore) SetDone(index int, done bool) bool {

@@ -71,6 +71,40 @@ func TestTaskStoreSelectsWithoutTouchingRunningTimer(t *testing.T) {
 	}
 }
 
+func TestTaskStoreRenamesTasks(t *testing.T) {
+	store := newTaskStore()
+	store.Add("Initial")
+
+	if !store.Start(0) {
+		t.Fatal("expected task to start")
+	}
+	store.AdvanceActive(5 * time.Second)
+
+	if !store.Rename(0, "  Updated title  ") {
+		t.Fatal("expected task to be renamed")
+	}
+
+	task, _ := store.Task(0)
+	if task.title != "Updated title" {
+		t.Fatalf("expected renamed task title, got %q", task.title)
+	}
+	if !task.running || task.remaining != workDuration-5*time.Second {
+		t.Fatalf("renaming should not change timer state, got %+v", task)
+	}
+
+	if store.Rename(0, "   ") {
+		t.Fatal("blank title should not be accepted")
+	}
+	if store.Rename(1, "Missing") {
+		t.Fatal("out-of-range task should not be renamed")
+	}
+
+	task, _ = store.Task(0)
+	if task.title != "Updated title" {
+		t.Fatalf("failed rename should preserve title, got %q", task.title)
+	}
+}
+
 func TestStartingAnotherTaskPausesPreviousTimer(t *testing.T) {
 	store := newTaskStore()
 	store.Add("First")
@@ -316,6 +350,7 @@ func TestTaskListTemplateRendersTimerAndControls(t *testing.T) {
 	ui := newPomodoroUI(a)
 	w.SetContent(ui.content)
 	ui.store.Add("Посмотреть ИП")
+	ui.store.Add("Написать отчет")
 	if ui.addButton.Text != "" {
 		t.Fatalf("add button should be icon-only, got %q", ui.addButton.Text)
 	}
@@ -340,12 +375,54 @@ func TestTaskListTemplateRendersTimerAndControls(t *testing.T) {
 	if row.start.Text != "" || row.pause.Text != "" || row.reset.Text != "" || row.delete.Text != "" {
 		t.Fatalf("task controls should be icon-only, got %q/%q/%q/%q", row.start.Text, row.pause.Text, row.reset.Text, row.delete.Text)
 	}
-	if !row.start.Visible() || !row.delete.Visible() || row.timer.Visible() || row.pause.Visible() || row.reset.Visible() {
-		t.Fatal("idle task should show only start and delete icons")
+	if !row.start.Visible() || !row.delete.Visible() || row.timer.Visible() || row.pause.Visible() || row.reset.Visible() || row.editor.Visible() {
+		t.Fatal("idle task should show start and delete icons")
+	}
+
+	row.title.Tapped(&fyne.PointEvent{})
+	if ui.editing != 0 {
+		t.Fatalf("expected task to enter edit mode, got editing=%d", ui.editing)
+	}
+	ui.taskList.UpdateItem(0, item)
+	if !row.editor.Visible() || row.check.Visible() || row.title.Visible() || row.start.Visible() || row.delete.Visible() {
+		t.Fatal("editing task should show only the title editor")
+	}
+	if row.editor.Text != "Посмотреть ИП" {
+		t.Fatalf("editor should start with current task title, got %q", row.editor.Text)
+	}
+
+	row.editor.SetText("  Обновить ИП  ")
+	secondItem := ui.taskList.CreateItem()
+	secondRow, ok := findTaskRowParts(secondItem)
+	if !ok {
+		t.Fatalf("expected second row template parts, got item=%T", secondItem)
+	}
+	ui.taskList.UpdateItem(1, secondItem)
+	secondRow.title.Tapped(&fyne.PointEvent{})
+	task, _ := ui.store.Task(0)
+	if task.title != "Обновить ИП" {
+		t.Fatalf("selecting another task should save edited title, got %q", task.title)
+	}
+	if ui.editing != -1 {
+		t.Fatalf("selecting another task should exit edit mode, got editing=%d", ui.editing)
+	}
+	if ui.store.Selected() != 1 {
+		t.Fatalf("clicking another task title should select it, got selected=%d", ui.store.Selected())
+	}
+
+	secondRow.title.Tapped(&fyne.PointEvent{})
+	if ui.editing != 1 {
+		t.Fatalf("clicking selected task title again should edit it, got editing=%d", ui.editing)
+	}
+	secondRow.editor.SetText("Обновленный отчет")
+	secondRow.editor.OnSubmitted(secondRow.editor.Text)
+	secondTask, _ := ui.store.Task(1)
+	if secondTask.title != "Обновленный отчет" {
+		t.Fatalf("submitting editor should save selected task title, got %q", secondTask.title)
 	}
 
 	row.start.OnTapped()
-	task, _ := ui.store.Task(0)
+	task, _ = ui.store.Task(0)
 	if !task.running {
 		t.Fatal("start button should start task timer")
 	}
@@ -373,15 +450,15 @@ func TestTaskListTemplateRendersTimerAndControls(t *testing.T) {
 		t.Fatal("checkbox should mark task done")
 	}
 	ui.taskList.UpdateItem(0, item)
-	if row.title.Text != "Посмотреть ИП" {
+	if row.title.Text != "Обновить ИП" {
 		t.Fatalf("done task should show only original title, got %q", row.title.Text)
 	}
-	if !row.delete.Visible() || row.timer.Visible() || row.start.Visible() || row.pause.Visible() || row.reset.Visible() {
+	if !row.delete.Visible() || row.timer.Visible() || row.start.Visible() || row.pause.Visible() || row.reset.Visible() || row.editor.Visible() {
 		t.Fatal("done task should hide timer controls and keep delete")
 	}
 
 	row.delete.OnTapped()
-	if ui.store.Len() != 0 {
+	if ui.store.Len() != 1 {
 		t.Fatalf("delete button should remove task, got len=%d", ui.store.Len())
 	}
 }

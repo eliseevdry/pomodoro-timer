@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -23,16 +24,40 @@ type pomodoroUI struct {
 	taskEntry *widget.Entry
 	taskList  *widget.List
 	addButton *widget.Button
+
+	editing      int
+	editingTitle string
+	tasksFile    string
 }
 
 type taskRowParts struct {
 	check  *widget.Check
-	title  *widget.Label
+	title  *tappableLabel
+	editor *widget.Entry
 	timer  *widget.Label
 	start  *widget.Button
 	pause  *widget.Button
 	reset  *widget.Button
 	delete *widget.Button
+}
+
+type tappableLabel struct {
+	widget.Label
+
+	onTapped func()
+}
+
+func newTappableLabel(text string) *tappableLabel {
+	label := &tappableLabel{}
+	label.Text = text
+	label.ExtendBaseWidget(label)
+	return label
+}
+
+func (l *tappableLabel) Tapped(*fyne.PointEvent) {
+	if l.onTapped != nil {
+		l.onTapped()
+	}
 }
 
 func main() {
@@ -41,6 +66,12 @@ func main() {
 	w.Resize(fyne.NewSize(900, 560))
 
 	ui := newPomodoroUI(a)
+	if path, err := defaultTasksFilePath(); err != nil {
+		log.Printf("task persistence disabled: %v", err)
+	} else if err := ui.enablePersistence(path); err != nil {
+		log.Printf("task persistence disabled: %v", err)
+		a.SendNotification(fyne.NewNotification("Не удалось загрузить задачи", err.Error()))
+	}
 	w.SetContent(ui.content)
 
 	ticker := time.NewTicker(time.Second)
@@ -52,8 +83,9 @@ func main() {
 
 func newPomodoroUI(a fyne.App) *pomodoroUI {
 	ui := &pomodoroUI{
-		app:   a,
-		store: newTaskStore(),
+		app:     a,
+		store:   newTaskStore(),
+		editing: -1,
 	}
 
 	ui.taskEntry = widget.NewEntry()
@@ -88,8 +120,10 @@ func (ui *pomodoroUI) newTaskList() *widget.List {
 		},
 		func() fyne.CanvasObject {
 			check := widget.NewCheck("", nil)
-			title := widget.NewLabel("")
+			title := newTappableLabel("")
 			title.Truncation = fyne.TextTruncateEllipsis
+			editor := widget.NewEntry()
+			editor.SetPlaceHolder("Task")
 
 			timer := widget.NewLabelWithStyle(formatDuration(workDuration), fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 
@@ -98,7 +132,8 @@ func (ui *pomodoroUI) newTaskList() *widget.List {
 			resetButton := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), nil)
 			deleteButton := widget.NewButtonWithIcon("", theme.DeleteIcon(), nil)
 
-			taskText := container.NewBorder(nil, nil, nil, timer, title)
+			taskTitle := container.NewStack(title, editor)
+			taskText := container.NewBorder(nil, nil, nil, timer, taskTitle)
 			controls := container.NewHBox(startButton, pauseButton, resetButton, deleteButton)
 			return container.NewBorder(nil, nil, check, controls, taskText)
 		},
@@ -117,7 +152,10 @@ func (ui *pomodoroUI) newTaskList() *widget.List {
 			row.check.OnChanged = nil
 			row.check.SetChecked(task.done)
 			row.check.OnChanged = func(done bool) {
-				ui.store.SetDone(index, done)
+				ui.saveCurrentEdit()
+				if ui.store.SetDone(index, done) {
+					ui.persistTasks()
+				}
 				ui.refreshTasks()
 			}
 
@@ -130,6 +168,27 @@ func (ui *pomodoroUI) newTaskList() *widget.List {
 			row.title.TextStyle = fyne.TextStyle{Italic: task.done}
 			row.title.Refresh()
 			row.timer.SetText(formatDuration(task.remaining))
+
+			row.editor.OnChanged = nil
+			row.editor.OnSubmitted = nil
+			editorText := task.title
+			if ui.editing == index {
+				editorText = ui.editingTitle
+			}
+			if row.editor.Text != editorText {
+				row.editor.SetText(editorText)
+			}
+			row.editor.OnChanged = func(text string) {
+				if ui.editing == index {
+					ui.editingTitle = text
+				}
+			}
+			row.editor.OnSubmitted = func(text string) {
+				ui.saveTaskTitle(index, text, true)
+			}
+			row.title.onTapped = func() {
+				ui.taskTitleTapped(index)
+			}
 
 			row.start.OnTapped = func() {
 				ui.startTask(index)
@@ -144,12 +203,46 @@ func (ui *pomodoroUI) newTaskList() *widget.List {
 				ui.deleteTask(index)
 			}
 
-			updateTaskRowVisibility(row, task, index == ui.store.Active())
+			editing := index == ui.editing
+			updateTaskRowVisibility(row, task, index == ui.store.Active(), editing)
+			if editing {
+				focusEntry(row.editor)
+			}
 		},
 	)
 }
 
-func updateTaskRowVisibility(row taskRowParts, task task, active bool) {
+func focusEntry(entry *widget.Entry) {
+	a := fyne.CurrentApp()
+	if a == nil {
+		return
+	}
+
+	canvas := a.Driver().CanvasForObject(entry)
+	if canvas == nil || canvas.Focused() == entry {
+		return
+	}
+
+	canvas.Focus(entry)
+}
+
+func updateTaskRowVisibility(row taskRowParts, task task, active bool, editing bool) {
+	if editing {
+		row.check.Hide()
+		row.title.Hide()
+		row.editor.Show()
+		row.timer.Hide()
+		row.start.Hide()
+		row.pause.Hide()
+		row.reset.Hide()
+		row.delete.Hide()
+		return
+	}
+
+	row.check.Show()
+	row.title.Show()
+	row.editor.Hide()
+
 	switch {
 	case task.done:
 		row.timer.Hide()
@@ -189,6 +282,7 @@ func findTaskRowParts(item fyne.CanvasObject) (taskRowParts, bool) {
 
 	ok := parts.check != nil &&
 		parts.title != nil &&
+		parts.editor != nil &&
 		parts.timer != nil &&
 		parts.start != nil &&
 		parts.pause != nil &&
@@ -202,11 +296,13 @@ func collectTaskRowParts(item fyne.CanvasObject, parts *taskRowParts) {
 	switch object := item.(type) {
 	case *widget.Check:
 		parts.check = object
+	case *widget.Entry:
+		parts.editor = object
+	case *tappableLabel:
+		parts.title = object
 	case *widget.Label:
 		if object.TextStyle.Bold {
 			parts.timer = object
-		} else if parts.title == nil {
-			parts.title = object
 		}
 	case *widget.Button:
 		switch iconName(object.Icon) {
@@ -237,6 +333,8 @@ func iconName(resource fyne.Resource) string {
 }
 
 func (ui *pomodoroUI) addTask() {
+	ui.saveCurrentEdit()
+
 	hadSelection := ui.store.Selected() != -1
 	index, ok := ui.store.Add(ui.taskEntry.Text)
 	if !ok {
@@ -244,6 +342,7 @@ func (ui *pomodoroUI) addTask() {
 	}
 
 	ui.taskEntry.SetText("")
+	ui.persistTasks()
 	ui.refreshTasks()
 
 	if !hadSelection {
@@ -253,31 +352,100 @@ func (ui *pomodoroUI) addTask() {
 }
 
 func (ui *pomodoroUI) selectTask(id widget.ListItemID) {
-	if !ui.store.Select(int(id)) {
+	index := int(id)
+	if ui.editing >= 0 && ui.editing != index {
+		ui.saveCurrentEdit()
+	}
+
+	if !ui.store.Select(index) {
 		return
 	}
 
 	ui.refreshTasks()
 }
 
+func (ui *pomodoroUI) taskTitleTapped(index int) {
+	if ui.editing == index {
+		return
+	}
+	if ui.store.Selected() == index {
+		ui.editTask(index)
+		return
+	}
+
+	ui.taskList.Select(widget.ListItemID(index))
+}
+
 func (ui *pomodoroUI) startTask(index int) {
+	ui.saveCurrentEdit()
 	ui.store.Start(index)
 	ui.refreshTasks()
 }
 
 func (ui *pomodoroUI) pauseTask(index int) {
+	ui.saveCurrentEdit()
 	ui.store.Pause(index)
 	ui.refreshTasks()
 }
 
 func (ui *pomodoroUI) resetTask(index int) {
+	ui.saveCurrentEdit()
 	ui.store.Reset(index)
 	ui.refreshTasks()
 }
 
+func (ui *pomodoroUI) editTask(index int) {
+	task, ok := ui.store.Task(index)
+	if !ok {
+		return
+	}
+
+	ui.store.Select(index)
+	ui.editing = index
+	ui.editingTitle = task.title
+	ui.refreshTasks()
+}
+
+func (ui *pomodoroUI) saveCurrentEdit() {
+	if ui.editing < 0 {
+		return
+	}
+
+	ui.saveTaskTitle(ui.editing, ui.editingTitle, false)
+}
+
+func (ui *pomodoroUI) saveTaskTitle(index int, title string, refresh bool) {
+	if ui.editing != index {
+		return
+	}
+
+	if ui.store.Rename(index, title) {
+		ui.persistTasks()
+	}
+
+	ui.editing = -1
+	ui.editingTitle = ""
+	if refresh {
+		ui.refreshTasks()
+	}
+}
+
 func (ui *pomodoroUI) deleteTask(index int) {
+	if ui.editing >= 0 && ui.editing != index {
+		ui.saveCurrentEdit()
+	}
+
 	if !ui.store.Delete(index) {
 		return
+	}
+	ui.persistTasks()
+
+	switch {
+	case ui.editing == index:
+		ui.editing = -1
+		ui.editingTitle = ""
+	case ui.editing > index:
+		ui.editing--
 	}
 
 	ui.refreshTasks()
@@ -288,6 +456,27 @@ func (ui *pomodoroUI) deleteTask(index int) {
 
 func (ui *pomodoroUI) refreshTasks() {
 	ui.taskList.Refresh()
+}
+
+func (ui *pomodoroUI) enablePersistence(path string) error {
+	snapshot, err := loadTasksCSV(path)
+	if err != nil {
+		return err
+	}
+
+	ui.store.Restore(snapshot)
+	ui.tasksFile = path
+	return nil
+}
+
+func (ui *pomodoroUI) persistTasks() {
+	if ui.tasksFile == "" {
+		return
+	}
+	if err := saveTasksCSV(ui.tasksFile, ui.store.Snapshot()); err != nil {
+		log.Printf("cannot save tasks: %v", err)
+		ui.app.SendNotification(fyne.NewNotification("Не удалось сохранить задачи", err.Error()))
+	}
 }
 
 func (ui *pomodoroUI) runTimer(ticker *time.Ticker) {
